@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: ditare-api
+Version: 0.1.0
+Summary: Backend API for Ditare macOS dictation app
+Requires-Python: >=3.12
+Requires-Dist: fastapi>=0.110.0
+Requires-Dist: uvicorn[standard]>=0.27.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: slowapi>=0.1.9
+Requires-Dist: redis>=5.0.0
+Requires-Dist: python-jose[cryptography]>=3.3.0
+Requires-Dist: pydantic-settings>=2.0.0
