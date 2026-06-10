@@ -120,12 +120,13 @@ async def fetch_apple_jwks() -> Dict[str, Any]:
             raise HTTPException(status_code=502, detail="Failed to fetch Apple JWKS")
         return resp.json()
 
-def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) -> Dict[str, Any]:
+async def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) -> Dict[str, Any]:
     """Verify Apple identity token (RS256 JWT) and return claims."""
     try:
-        # Fetch JWKS and create client
+        # Fetch JWKS and create client (run blocking I/O in thread pool)
+        loop = __import__('asyncio').get_event_loop()
         jwks_client = PyJWKClient(APPLE_JWKS_URL, cache_keys=True)
-        signing_key = jwks_client.get_signing_key_from_jwt(identity_token)
+        signing_key = await loop.run_in_executor(None, jwks_client.get_signing_key_from_jwt, identity_token)
         
         # Decode and verify token
         payload = jwt.decode(
@@ -156,6 +157,8 @@ def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) 
 
 def generate_session_token(user_id: str, apple_sub: str) -> str:
     """Generate HS256 session JWT with 30-day expiry."""
+    if not settings.jwt_secret:
+        raise RuntimeError("JWT_SECRET is not configured")
     now = int(time.time())
     expires_in = 2592000  # 30 days
     payload = {
@@ -165,8 +168,7 @@ def generate_session_token(user_id: str, apple_sub: str) -> str:
         "exp": now + expires_in,
         "iss": "ditare-api"
     }
-    secret = settings.jwt_secret or secrets.token_urlsafe(32)
-    return jwt.encode(payload, secret, algorithm="HS256")
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 def upsert_user(apple_user_id: str, email: Optional[str], full_name: Optional[str]) -> None:
     """Upsert user in Redis."""
@@ -379,7 +381,8 @@ async def cleanup(
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
 @app.post("/auth/exchange", response_model=AuthExchangeResponse)
-async def auth_exchange(body: AuthExchangeRequest):
+@limiter.limit("10/minute")
+async def auth_exchange(request: Request, body: AuthExchangeRequest):
     """
     Exchange Apple identity token for Ditare session token.
     
@@ -398,7 +401,7 @@ async def auth_exchange(body: AuthExchangeRequest):
         raise HTTPException(status_code=401, detail="Missing identity_token or apple_user_id")
     
     # Verify Apple identity token
-    claims = verify_apple_token(
+    claims = await verify_apple_token(
         body.identity_token,
         body.apple_user_id,
         settings.apple_bundle_id

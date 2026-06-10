@@ -1,6 +1,6 @@
 import pytest
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 from ditare_api.main import app, settings
 
@@ -171,7 +171,7 @@ class TestAuthExchangeIntegration:
     @patch("ditare_api.main.redis_client")
     @patch.object(settings, "apple_team_id", "TEAM123")
     @patch.object(settings, "apple_bundle_id", "com.ditare.app")
-    @patch.object(settings, "jwt_secret", "test_secret_key")
+    @patch.object(settings, "jwt_secret", "this_is_a_very_secure_test_secret_key_32b")
     def test_full_flow_with_redis(
         self, mock_redis, mock_jwks_client, mock_jwt_decode
     ):
@@ -207,6 +207,7 @@ class TestAuthExchangeIntegration:
     @patch("ditare_api.main.redis_client")
     @patch.object(settings, "apple_team_id", "TEAM123")
     @patch.object(settings, "apple_bundle_id", "com.ditare.app")
+    @patch.object(settings, "jwt_secret", "this_is_a_very_secure_test_secret_key_32b")
     def test_user_without_optional_fields(
         self, mock_redis, mock_jwks_client, mock_jwt_decode
     ):
