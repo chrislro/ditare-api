@@ -557,7 +557,6 @@ async def revenuecat_webhook(request: Request, body: RevenueCatWebhook):
         "NON_RENEWING_PURCHASE",
         "PRODUCT_CHANGE",
         "UNCANCELLATION",
-        "SUBSCRIPTION_PAUSED",
     }
     inactive_events = {
         "CANCELLATION",
