@@ -10,6 +10,7 @@ import logging
 import redis
 import time
 import secrets
+import json
 from typing import Optional, Dict, Any
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel
@@ -17,7 +18,28 @@ import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import InvalidTokenError
 
-logging.basicConfig(level=logging.INFO)
+# Structured JSON logging in production
+if os.environ.get("ENV") == "production":
+    class JSONFormatter(logging.Formatter):
+        def format(self, record):
+            log_obj = {
+                "timestamp": self.formatTime(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            if hasattr(record, "request_id"):
+                log_obj["request_id"] = record.request_id
+            if record.exc_info:
+                log_obj["exception"] = self.formatException(record.exc_info)
+            return json.dumps(log_obj, default=str)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+else:
+    logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("ditare-api")
 
 # Configuration
@@ -27,6 +49,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     apple_team_id: str = ""  # Set after DIT-0
     apple_bundle_id: str = ""  # Ditare macOS app bundle ID
+    revenuecat_api_key: str = ""  # RevenueCat REST API key for entitlement checks
     revenuecat_webhook_secret: str = ""  # Set when RevenueCat project exists
     env: str = "development"
     jwt_secret: str = ""  # HS256 secret for session tokens
@@ -50,10 +73,16 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS
+# CORS — restricted to known origins only
+# Note: macOS native apps do not send Origin headers, so CORS does not apply.
+ALLOWED_ORIGINS = [
+    "https://ditare.app",
+    "https://ditare.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to ditare app + landing page
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,16 +112,68 @@ def get_auth_token(authorization: Optional[str] = Header(None)) -> Optional[str]
         return authorization[7:]
     return authorization
 
-def check_pro_entitlement(token: str) -> bool:
-    """Check if user has Pro entitlement. Stub until RevenueCat webhooks are wired."""
+async def check_pro_entitlement(token: str) -> bool:
+    """Check if user has Pro entitlement via RevenueCat REST API with Redis caching."""
     if not token:
         return False
-    # TODO: Implement proper entitlement check via RevenueCat or Apple
-    # For now, allow all valid-looking tokens in development
+
+    # In development, allow all valid-looking tokens
     if settings.env == "development":
         return True
-    # Check Redis for active entitlement
-    return redis_client.get(f"entitlement:pro:{token}") == "active"
+
+    # Get user_id from token
+    user_id = get_user_id(token)
+    if not user_id:
+        return False
+
+    # 1. Check Redis cache first (5-minute TTL)
+    cache_key = f"entitlement:pro:{user_id}"
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        logger.debug(f"Entitlement cache hit for {user_id}")
+        return cached == "active"
+
+    # 2. No cache — call RevenueCat REST API
+    if not settings.revenuecat_api_key:
+        logger.warning("RevenueCat API key not configured; falling back to webhook-only entitlement")
+        # Fallback: check webhook-set entitlement (no TTL, persistent)
+        webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+        return webhook_state == "active"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.revenuecat.com/v1/subscribers/{user_id}",
+                headers={"Authorization": f"Bearer {settings.revenuecat_api_key}"}
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                subscriber = data.get("subscriber", {})
+                entitlements = subscriber.get("entitlements", {})
+                pro_entitlement = entitlements.get("pro", {})
+                is_active = pro_entitlement.get("expires_date") is not None
+
+                # Cache result in Redis with 5-minute TTL (300 seconds)
+                cache_value = "active" if is_active else "inactive"
+                redis_client.setex(cache_key, 300, cache_value)
+                logger.info(f"RevenueCat entitlement check for {user_id}: {cache_value}")
+                return is_active
+            elif resp.status_code == 404:
+                # User not found in RevenueCat
+                redis_client.setex(cache_key, 300, "inactive")
+                logger.info(f"RevenueCat subscriber not found: {user_id}")
+                return False
+            else:
+                logger.warning(f"RevenueCat API error {resp.status_code} for {user_id}")
+                # On error, fall back to webhook state if available
+                webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+                return webhook_state == "active"
+    except Exception as e:
+        logger.exception(f"RevenueCat entitlement check failed for {user_id}")
+        # On exception, fall back to webhook state if available
+        webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+        return webhook_state == "active"
 
 def get_user_id(token: str) -> Optional[str]:
     """Extract user ID from session token."""
@@ -249,7 +330,7 @@ async def me(authorization: Optional[str] = Header(None)):
     """Get current user info and entitlement."""
     token = get_auth_token(authorization)
     user_id = get_user_id(token) if token else None
-    is_pro = check_pro_entitlement(token) if token else False
+    is_pro = await check_pro_entitlement(token) if token else False
     
     return MeResponse(
         user_id=user_id,
@@ -276,15 +357,16 @@ async def transcribe(
     """
     # Pro-only check
     token = get_auth_token(authorization)
-    if not check_pro_entitlement(token):
+    if not await check_pro_entitlement(token):
         raise HTTPException(status_code=403, detail="Pro subscription required")
     
     provider = "groq"
     model = "whisper-large-v3"
     provider_cfg = PROVIDERS[provider]
     
-    if not provider_cfg["key"]:
-        raise HTTPException(status_code=500, detail="Groq API key not configured")
+    # Check settings directly (PROVIDERS dict captures key at import time)
+    if not settings.groq_api_key:
+        raise HTTPException(status_code=403, detail="Groq API key not configured")
     
     files = {"file": (audio.filename or "audio.m4a", audio.file, audio.content_type or "audio/m4a")}
     data = {"model": model, "response_format": "text"}
@@ -293,7 +375,7 @@ async def transcribe(
     if prompt:
         data["prompt"] = prompt[:800]
     
-    headers = {"Authorization": f"Bearer {provider_cfg['key']}"}
+    headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -332,11 +414,11 @@ async def cleanup(
     """
     # Pro-only check
     token = get_auth_token(authorization)
-    if not check_pro_entitlement(token):
+    if not await check_pro_entitlement(token):
         raise HTTPException(status_code=403, detail="Pro subscription required")
     
     if not settings.openai_api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        raise HTTPException(status_code=403, detail="OpenAI API key not configured")
     
     # Profile-based system prompts (same as macOS app)
     SYSTEM_PROMPTS = {

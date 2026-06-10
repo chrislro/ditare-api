@@ -26,8 +26,11 @@ FastAPI backend for the Ditare macOS dictation app.
 | `GROQ_API_KEY` | Groq API key for transcription |
 | `OPENAI_API_KEY` | OpenAI API key for cleanup |
 | `REDIS_URL` | Redis connection string |
-| `APPLE_TEAM_ID` | Apple Developer Team ID (set after DIT-0) |
+| `APPLE_TEAM_ID` | Apple Developer Team ID |
+| `APPLE_BUNDLE_ID` | Ditare macOS app bundle ID |
+| `REVENUECAT_API_KEY` | RevenueCat REST API key (for entitlement checks) |
 | `REVENUECAT_WEBHOOK_SECRET` | RevenueCat webhook secret |
+| `JWT_SECRET` | HS256 secret for session tokens |
 | `ENV` | `development` or `production` |
 
 ## Local Development

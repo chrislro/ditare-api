@@ -1,9 +1,105 @@
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from ditare_api.main import app, settings, redis_client
 
 client = TestClient(app)
+
+# CORS tests
+def test_cors_allowed_origin():
+    """Should allow requests from allowed origins."""
+    resp = client.get("/", headers={"Origin": "https://ditare.app"})
+    assert resp.status_code == 200
+    assert "access-control-allow-origin" in resp.headers
+    assert resp.headers["access-control-allow-origin"] == "https://ditare.app"
+
+def test_cors_blocked_origin():
+    """Should not allow requests from disallowed origins."""
+    resp = client.get("/", headers={"Origin": "https://evil.com"})
+    assert resp.status_code == 200
+    # When origin is not allowed, CORS middleware does not set the header
+    # or sets it to the allowed origin (depending on implementation)
+    # The key is that the browser would block it
+    assert resp.headers.get("access-control-allow-origin") != "https://evil.com"
+
+def test_cors_preflight_allowed():
+    """Should allow preflight from allowed origin."""
+    resp = client.options(
+        "/transcribe",
+        headers={
+            "Origin": "https://ditare.vercel.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Authorization",
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "https://ditare.vercel.app"
+
+def test_cors_preflight_blocked():
+    """Should block preflight from disallowed origin."""
+    resp = client.options(
+        "/transcribe",
+        headers={
+            "Origin": "https://evil.com",
+            "Access-Control-Request-Method": "POST",
+        }
+    )
+    assert resp.status_code == 400  # CORS middleware rejects preflight for disallowed origin
+
+# API key missing tests
+def test_transcribe_missing_api_key_returns_403():
+    """Should return 403 (not 500) when Groq API key is missing."""
+    with patch.object(settings, "env", "development"), patch.object(settings, "groq_api_key", ""):
+        # In development, entitlement check passes with any token
+        resp = client.post(
+            "/transcribe",
+            files={"audio": ("test.m4a", b"fake audio", "audio/m4a")},
+            headers={"Authorization": "Bearer fake-token"}
+        )
+        assert resp.status_code == 403
+        assert "Groq API key not configured" in resp.json()["detail"]
+
+def test_cleanup_missing_api_key_returns_403():
+    """Should return 403 (not 500) when OpenAI API key is missing."""
+    with patch.object(settings, "env", "development"), patch.object(settings, "openai_api_key", ""):
+        # In development, entitlement check passes with any token
+        resp = client.post(
+            "/cleanup",
+            json={"text": "hello"},
+            headers={"Authorization": "Bearer fake-token"}
+        )
+        assert resp.status_code == 403
+        assert "OpenAI API key not configured" in resp.json()["detail"]
+
+# Entitlement cache tests
+@pytest.mark.asyncio
+async def test_entitlement_cache_hit():
+    """Should use cached entitlement from Redis."""
+    from ditare_api.main import check_pro_entitlement
+    
+    with patch.object(settings, "env", "production"):
+        # Set up cache
+        redis_client.setex("entitlement:pro:test-user", 300, "active")
+        
+        with patch("ditare_api.main.get_user_id", return_value="test-user"):
+            result = await check_pro_entitlement("some-token")
+            assert result is True
+        
+        redis_client.delete("entitlement:pro:test-user")
+
+@pytest.mark.asyncio
+async def test_entitlement_cache_inactive():
+    """Should return False for cached inactive entitlement."""
+    from ditare_api.main import check_pro_entitlement
+    
+    with patch.object(settings, "env", "production"):
+        redis_client.setex("entitlement:pro:test-user-inactive", 300, "inactive")
+        
+        with patch("ditare_api.main.get_user_id", return_value="test-user-inactive"):
+            result = await check_pro_entitlement("some-token")
+            assert result is False
+        
+        redis_client.delete("entitlement:pro:test-user-inactive")
 
 # Existing tests...
 
