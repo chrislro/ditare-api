@@ -427,19 +427,68 @@ async def auth_exchange(body: AuthExchangeRequest):
 async def revenuecat_webhook(request: Request, body: RevenueCatWebhook):
     """
     Idempotent RevenueCat webhook handler.
-    
-    **Stub — wire when RevenueCat project exists.**
+
     Handles subscription events: INITIAL_PURCHASE, RENEWAL, CANCELLATION, etc.
+    - Verifies webhook signature via shared secret
+    - Deduplicates by event.id (stores processed IDs in Redis)
+    - Updates Redis entitlement:pro:<user_id> based on event type
     """
     if not settings.revenuecat_webhook_secret:
         raise HTTPException(
             status_code=501,
             detail="RevenueCat webhook secret not configured"
         )
-    
-    # TODO: Verify webhook signature
-    # TODO: Handle events idempotently (dedupe by event_id)
-    # TODO: Update Redis entitlement state
-    
-    logger.info(f"RevenueCat event received: {body.event.get('type', 'unknown')}")
-    return {"ok": True, "received": True}
+
+    # 1. Verify webhook signature (RevenueCat sends Authorization: Bearer <secret>)
+    auth_header = request.headers.get("authorization", "")
+    expected = f"Bearer {settings.revenuecat_webhook_secret}"
+    if not secrets.compare_digest(auth_header, expected):
+        logger.warning("RevenueCat webhook signature mismatch")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    event = body.event
+    event_id = event.get("id")
+    event_type = event.get("type", "UNKNOWN")
+    app_user_id = event.get("app_user_id")
+
+    if not event_id:
+        logger.warning("RevenueCat webhook missing event.id")
+        raise HTTPException(status_code=400, detail="Missing event.id")
+    if not app_user_id:
+        logger.warning("RevenueCat webhook missing app_user_id")
+        raise HTTPException(status_code=400, detail="Missing app_user_id")
+
+    # 2. Idempotency: dedupe by event.id (Redis key with 7-day TTL)
+    dedupe_key = f"revenuecat:processed:{event_id}"
+    if not redis_client.set(dedupe_key, "1", nx=True, ex=604800):
+        logger.info(f"RevenueCat event {event_id} already processed; skipping")
+        return {"ok": True, "idempotent": True}
+
+    # 3. Update entitlement state based on event type
+    entitlement_key = f"entitlement:pro:{app_user_id}"
+    active_events = {
+        "INITIAL_PURCHASE",
+        "RENEWAL",
+        "NON_RENEWING_PURCHASE",
+        "PRODUCT_CHANGE",
+        "UNCANCELLATION",
+        "SUBSCRIPTION_PAUSED",
+    }
+    inactive_events = {
+        "CANCELLATION",
+        "EXPIRATION",
+        "BILLING_ISSUE",
+        "SUBSCRIPTION_PAUSED",
+    }
+
+    if event_type in active_events:
+        redis_client.set(entitlement_key, "active")
+        logger.info(f"Set pro entitlement active for {app_user_id} (event={event_type})")
+    elif event_type in inactive_events:
+        redis_client.set(entitlement_key, "inactive")
+        logger.info(f"Set pro entitlement inactive for {app_user_id} (event={event_type})")
+    else:
+        logger.info(f"No entitlement change for {app_user_id} (event={event_type})")
+
+    logger.info(f"RevenueCat event {event_id} ({event_type}) processed for {app_user_id}")
+    return {"ok": True, "received": True, "event_type": event_type}
