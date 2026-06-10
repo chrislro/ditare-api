@@ -8,9 +8,14 @@ import httpx
 import os
 import logging
 import redis
+import time
+import secrets
 from typing import Optional, Dict, Any
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import InvalidTokenError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ditare-api")
@@ -21,8 +26,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     redis_url: str = "redis://localhost:6379/0"
     apple_team_id: str = ""  # Set after DIT-0
+    apple_bundle_id: str = ""  # Ditare macOS app bundle ID
     revenuecat_webhook_secret: str = ""  # Set when RevenueCat project exists
     env: str = "development"
+    jwt_secret: str = ""  # HS256 secret for session tokens
     
     class Config:
         env_file = ".env"
@@ -88,11 +95,91 @@ def check_pro_entitlement(token: str) -> bool:
     return redis_client.get(f"entitlement:pro:{token}") == "active"
 
 def get_user_id(token: str) -> Optional[str]:
-    """Extract user ID from token. Stub implementation."""
+    """Extract user ID from session token."""
     if not token:
         return None
-    # TODO: Implement proper token verification
-    return redis_client.get(f"token:user:{token}")
+    # First check Redis mapping
+    user_id = redis_client.get(f"token:user:{token}")
+    if user_id:
+        return user_id
+    # Fallback: verify JWT and extract sub
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"], issuer="ditare-api")
+        return payload.get("sub")
+    except Exception:
+        return None
+
+# Apple JWT verification helpers
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+
+async def fetch_apple_jwks() -> Dict[str, Any]:
+    """Fetch Apple's public JWKS."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(APPLE_JWKS_URL)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch Apple JWKS")
+        return resp.json()
+
+def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) -> Dict[str, Any]:
+    """Verify Apple identity token (RS256 JWT) and return claims."""
+    try:
+        # Fetch JWKS and create client
+        jwks_client = PyJWKClient(APPLE_JWKS_URL, cache_keys=True)
+        signing_key = jwks_client.get_signing_key_from_jwt(identity_token)
+        
+        # Decode and verify token
+        payload = jwt.decode(
+            identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=bundle_id,
+            issuer="https://appleid.apple.com"
+        )
+        
+        # Verify sub claim matches apple_user_id
+        if payload.get("sub") != apple_user_id:
+            raise ValueError("sub claim does not match apple_user_id")
+        
+        # Verify token is not expired (jwt.decode handles exp automatically)
+        # Verify issued at is not in the future (with 60s leeway)
+        iat = payload.get("iat")
+        if iat and iat > time.time() + 60:
+            raise ValueError("Token issued in the future")
+        
+        return payload
+    except InvalidTokenError as e:
+        logger.warning(f"Apple token verification failed: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid Apple identity token: {e}")
+    except Exception as e:
+        logger.exception("Apple token verification error")
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
+
+def generate_session_token(user_id: str, apple_sub: str) -> str:
+    """Generate HS256 session JWT with 30-day expiry."""
+    now = int(time.time())
+    expires_in = 2592000  # 30 days
+    payload = {
+        "sub": user_id,
+        "apple_sub": apple_sub,
+        "iat": now,
+        "exp": now + expires_in,
+        "iss": "ditare-api"
+    }
+    secret = settings.jwt_secret or secrets.token_urlsafe(32)
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+def upsert_user(apple_user_id: str, email: Optional[str], full_name: Optional[str]) -> None:
+    """Upsert user in Redis."""
+    user_key = f"user:{apple_user_id}"
+    user_data = {
+        "apple_user_id": apple_user_id,
+        "updated_at": str(int(time.time()))
+    }
+    if email:
+        user_data["email"] = email
+    if full_name:
+        user_data["full_name"] = full_name
+    redis_client.hset(user_key, mapping=user_data)
 
 # Request/Response models
 class CleanupRequest(BaseModel):
@@ -113,13 +200,15 @@ class MeResponse(BaseModel):
 
 class AuthExchangeRequest(BaseModel):
     identity_token: str
-    authorization_code: Optional[str] = None
+    apple_user_id: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
 
 class AuthExchangeResponse(BaseModel):
     ok: bool
-    api_key: str
+    session_token: str
+    expires_in: int
     user_id: str
-    entitlement: str
 
 class RevenueCatWebhook(BaseModel):
     event: Dict[str, Any]
@@ -292,23 +381,46 @@ async def cleanup(
 @app.post("/auth/exchange", response_model=AuthExchangeResponse)
 async def auth_exchange(body: AuthExchangeRequest):
     """
-    Exchange Apple identity token for Ditare API key.
+    Exchange Apple identity token for Ditare session token.
     
-    **Stub — implement after DIT-0 (Apple Developer Program active).**
-    Requires Apple Team ID verification.
+    Verifies the Apple identity token (RS256 JWT) against Apple's public keys,
+    upserts the user in Redis, generates a session JWT, and stores the mapping.
     """
-    if not settings.apple_team_id:
+    # Check required configuration
+    if not settings.apple_team_id or not settings.apple_bundle_id:
         raise HTTPException(
-            status_code=501, 
-            detail="Apple auth not yet configured. Complete DIT-0 first."
+            status_code=501,
+            detail="Apple auth not yet configured. Set APPLE_TEAM_ID and APPLE_BUNDLE_ID."
         )
     
-    # TODO: Verify Apple identity token with Apple servers
-    # TODO: Create or lookup user
-    # TODO: Generate API key and store in Redis
-    # TODO: Check RevenueCat entitlement
+    # Validate input
+    if not body.identity_token or not body.apple_user_id:
+        raise HTTPException(status_code=401, detail="Missing identity_token or apple_user_id")
     
-    raise HTTPException(status_code=501, detail="Not yet implemented — waiting for DIT-0")
+    # Verify Apple identity token
+    claims = verify_apple_token(
+        body.identity_token,
+        body.apple_user_id,
+        settings.apple_bundle_id
+    )
+    
+    # Upsert user in Redis
+    upsert_user(body.apple_user_id, body.email, body.full_name)
+    
+    # Generate session token
+    session_token = generate_session_token(body.apple_user_id, claims.get("sub", body.apple_user_id))
+    
+    # Store token→user mapping in Redis with 30-day TTL
+    redis_client.setex(f"token:user:{session_token}", 2592000, body.apple_user_id)
+    
+    logger.info(f"Auth exchange successful for user {body.apple_user_id}")
+    
+    return AuthExchangeResponse(
+        ok=True,
+        session_token=session_token,
+        expires_in=2592000,
+        user_id=body.apple_user_id
+    )
 
 @app.post("/webhooks/revenuecat")
 @limiter.limit("100/minute")

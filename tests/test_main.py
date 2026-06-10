@@ -32,9 +32,13 @@ def test_cleanup_no_auth():
     resp = client.post("/cleanup", json={"text": "hello"})
     assert resp.status_code in [403, 422]
 
+from unittest.mock import patch
+from ditare_api.main import settings
+
 def test_auth_exchange_not_configured():
-    resp = client.post("/auth/exchange", json={"identity_token": "test"})
-    assert resp.status_code == 501
+    with patch.object(settings, "apple_team_id", ""), patch.object(settings, "apple_bundle_id", ""):
+        resp = client.post("/auth/exchange", json={"identity_token": "test", "apple_user_id": "test"})
+        assert resp.status_code == 501
 
 def test_revenuecat_webhook_not_configured():
     resp = client.post("/webhooks/revenuecat", json={"event": {"type": "TEST"}})
