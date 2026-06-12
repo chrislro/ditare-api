@@ -8,11 +8,39 @@ import httpx
 import os
 import logging
 import redis
+import time
+import secrets
+import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import InvalidTokenError
 
-logging.basicConfig(level=logging.INFO)
+# Structured JSON logging in production
+if os.environ.get("ENV") == "production":
+    class JSONFormatter(logging.Formatter):
+        def format(self, record):
+            log_obj = {
+                "timestamp": self.formatTime(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            if hasattr(record, "request_id"):
+                log_obj["request_id"] = record.request_id
+            if record.exc_info:
+                log_obj["exception"] = self.formatException(record.exc_info)
+            return json.dumps(log_obj, default=str)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+else:
+    logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("ditare-api")
 
 # Configuration
@@ -21,8 +49,11 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     redis_url: str = "redis://localhost:6379/0"
     apple_team_id: str = ""  # Set after DIT-0
+    apple_bundle_id: str = ""  # Ditare macOS app bundle ID
+    revenuecat_api_key: str = ""  # RevenueCat REST API key for entitlement checks
     revenuecat_webhook_secret: str = ""  # Set when RevenueCat project exists
     env: str = "development"
+    jwt_secret: str = ""  # HS256 secret for session tokens
     
     class Config:
         env_file = ".env"
@@ -43,10 +74,16 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS
+# CORS — restricted to known origins only
+# Note: macOS native apps do not send Origin headers, so CORS does not apply.
+ALLOWED_ORIGINS = [
+    "https://ditare.app",
+    "https://ditare.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to ditare app + landing page
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,23 +113,164 @@ def get_auth_token(authorization: Optional[str] = Header(None)) -> Optional[str]
         return authorization[7:]
     return authorization
 
-def check_pro_entitlement(token: str) -> bool:
-    """Check if user has Pro entitlement. Stub until RevenueCat webhooks are wired."""
+async def check_pro_entitlement(token: str) -> bool:
+    """Check if user has Pro entitlement via RevenueCat REST API with Redis caching."""
     if not token:
         return False
-    # TODO: Implement proper entitlement check via RevenueCat or Apple
-    # For now, allow all valid-looking tokens in development
+
+    # In development, allow all valid-looking tokens
     if settings.env == "development":
         return True
-    # Check Redis for active entitlement
-    return redis_client.get(f"entitlement:pro:{token}") == "active"
+
+    # Get user_id from token
+    user_id = get_user_id(token)
+    if not user_id:
+        return False
+
+    # 1. Check Redis cache first (5-minute TTL).
+    # NOTE: deliberately a separate key from the persistent webhook state
+    # (entitlement:pro:<user_id>) so the short-TTL API cache never clobbers it.
+    cache_key = f"entitlement:pro:cache:{user_id}"
+    cached = redis_client.get(cache_key)
+    if cached is not None:
+        logger.debug(f"Entitlement cache hit for {user_id}")
+        return cached == "active"
+
+    # 2. No cache — call RevenueCat REST API
+    if not settings.revenuecat_api_key:
+        logger.warning("RevenueCat API key not configured; falling back to webhook-only entitlement")
+        # Fallback: check webhook-set entitlement (no TTL, persistent)
+        webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+        return webhook_state == "active"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.revenuecat.com/v1/subscribers/{user_id}",
+                headers={"Authorization": f"Bearer {settings.revenuecat_api_key}"}
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                subscriber = data.get("subscriber", {})
+                entitlements = subscriber.get("entitlements", {})
+                pro_entitlement = entitlements.get("pro")
+                if not pro_entitlement:
+                    is_active = False
+                else:
+                    expires_date = pro_entitlement.get("expires_date")
+                    if expires_date is None:
+                        # Lifetime/promotional entitlements have no expiry
+                        is_active = True
+                    else:
+                        try:
+                            expires_at = datetime.fromisoformat(expires_date.replace("Z", "+00:00"))
+                            is_active = expires_at > datetime.now(timezone.utc)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Unparseable expires_date for {user_id}: {expires_date!r}")
+                            is_active = False
+
+                # Cache result in Redis with 5-minute TTL (300 seconds)
+                cache_value = "active" if is_active else "inactive"
+                redis_client.setex(cache_key, 300, cache_value)
+                logger.info(f"RevenueCat entitlement check for {user_id}: {cache_value}")
+                return is_active
+            elif resp.status_code == 404:
+                # User not found in RevenueCat
+                redis_client.setex(cache_key, 300, "inactive")
+                logger.info(f"RevenueCat subscriber not found: {user_id}")
+                return False
+            else:
+                logger.warning(f"RevenueCat API error {resp.status_code} for {user_id}")
+                # On error, fall back to webhook state if available
+                webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+                return webhook_state == "active"
+    except Exception as e:
+        logger.exception(f"RevenueCat entitlement check failed for {user_id}")
+        # On exception, fall back to webhook state if available
+        webhook_state = redis_client.get(f"entitlement:pro:{user_id}")
+        return webhook_state == "active"
 
 def get_user_id(token: str) -> Optional[str]:
-    """Extract user ID from token. Stub implementation."""
+    """Extract user ID from session token."""
     if not token:
         return None
-    # TODO: Implement proper token verification
-    return redis_client.get(f"token:user:{token}")
+    # First check Redis mapping
+    user_id = redis_client.get(f"token:user:{token}")
+    if user_id:
+        return user_id
+    # Fallback: verify JWT and extract sub
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"], issuer="ditare-api")
+        return payload.get("sub")
+    except Exception:
+        return None
+
+# Apple JWT verification helpers
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+
+async def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) -> Dict[str, Any]:
+    """Verify Apple identity token (RS256 JWT) and return claims."""
+    try:
+        # Fetch JWKS and create client (run blocking I/O in thread pool)
+        loop = __import__('asyncio').get_event_loop()
+        jwks_client = PyJWKClient(APPLE_JWKS_URL, cache_keys=True)
+        signing_key = await loop.run_in_executor(None, jwks_client.get_signing_key_from_jwt, identity_token)
+        
+        # Decode and verify token
+        payload = jwt.decode(
+            identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=bundle_id,
+            issuer="https://appleid.apple.com"
+        )
+        
+        # Verify sub claim matches apple_user_id
+        if payload.get("sub") != apple_user_id:
+            raise ValueError("sub claim does not match apple_user_id")
+        
+        # Verify token is not expired (jwt.decode handles exp automatically)
+        # Verify issued at is not in the future (with 60s leeway)
+        iat = payload.get("iat")
+        if iat and iat > time.time() + 60:
+            raise ValueError("Token issued in the future")
+        
+        return payload
+    except InvalidTokenError as e:
+        logger.warning(f"Apple token verification failed: {e}")
+        raise HTTPException(status_code=401, detail=f"Invalid Apple identity token: {e}")
+    except Exception as e:
+        logger.exception("Apple token verification error")
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
+
+def generate_session_token(user_id: str, apple_sub: str) -> str:
+    """Generate HS256 session JWT with 30-day expiry."""
+    if not settings.jwt_secret:
+        raise RuntimeError("JWT_SECRET is not configured")
+    now = int(time.time())
+    expires_in = 2592000  # 30 days
+    payload = {
+        "sub": user_id,
+        "apple_sub": apple_sub,
+        "iat": now,
+        "exp": now + expires_in,
+        "iss": "ditare-api"
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+def upsert_user(apple_user_id: str, email: Optional[str], full_name: Optional[str]) -> None:
+    """Upsert user in Redis."""
+    user_key = f"user:{apple_user_id}"
+    user_data = {
+        "apple_user_id": apple_user_id,
+        "updated_at": str(int(time.time()))
+    }
+    if email:
+        user_data["email"] = email
+    if full_name:
+        user_data["full_name"] = full_name
+    redis_client.hset(user_key, mapping=user_data)
 
 # Request/Response models
 class CleanupRequest(BaseModel):
@@ -113,13 +291,15 @@ class MeResponse(BaseModel):
 
 class AuthExchangeRequest(BaseModel):
     identity_token: str
-    authorization_code: Optional[str] = None
+    apple_user_id: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
 
 class AuthExchangeResponse(BaseModel):
     ok: bool
-    api_key: str
+    session_token: str
+    expires_in: int
     user_id: str
-    entitlement: str
 
 class RevenueCatWebhook(BaseModel):
     event: Dict[str, Any]
@@ -158,7 +338,7 @@ async def me(authorization: Optional[str] = Header(None)):
     """Get current user info and entitlement."""
     token = get_auth_token(authorization)
     user_id = get_user_id(token) if token else None
-    is_pro = check_pro_entitlement(token) if token else False
+    is_pro = await check_pro_entitlement(token) if token else False
     
     return MeResponse(
         user_id=user_id,
@@ -185,15 +365,16 @@ async def transcribe(
     """
     # Pro-only check
     token = get_auth_token(authorization)
-    if not check_pro_entitlement(token):
+    if not await check_pro_entitlement(token):
         raise HTTPException(status_code=403, detail="Pro subscription required")
     
     provider = "groq"
     model = "whisper-large-v3"
     provider_cfg = PROVIDERS[provider]
     
-    if not provider_cfg["key"]:
-        raise HTTPException(status_code=500, detail="Groq API key not configured")
+    # Check settings directly (PROVIDERS dict captures key at import time)
+    if not settings.groq_api_key:
+        raise HTTPException(status_code=403, detail="Groq API key not configured")
     
     files = {"file": (audio.filename or "audio.m4a", audio.file, audio.content_type or "audio/m4a")}
     data = {"model": model, "response_format": "text"}
@@ -202,7 +383,7 @@ async def transcribe(
     if prompt:
         data["prompt"] = prompt[:800]
     
-    headers = {"Authorization": f"Bearer {provider_cfg['key']}"}
+    headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -215,7 +396,8 @@ async def transcribe(
             
             text = resp.text.strip()
             only_punct = all(c in " \t\n!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~" for c in text)
-            if only_punct:
+            if only_punct and text:
+                logger.warning("Transcription output was punctuation-only; returning empty text")
                 text = ""
             
             return {"ok": True, "text": text, "chars": len(text), "provider": provider, "model": model}
@@ -241,11 +423,11 @@ async def cleanup(
     """
     # Pro-only check
     token = get_auth_token(authorization)
-    if not check_pro_entitlement(token):
+    if not await check_pro_entitlement(token):
         raise HTTPException(status_code=403, detail="Pro subscription required")
     
     if not settings.openai_api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        raise HTTPException(status_code=403, detail="OpenAI API key not configured")
     
     # Profile-based system prompts (same as macOS app)
     SYSTEM_PROMPTS = {
@@ -290,44 +472,122 @@ async def cleanup(
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
 @app.post("/auth/exchange", response_model=AuthExchangeResponse)
-async def auth_exchange(body: AuthExchangeRequest):
+@limiter.limit("10/minute")
+async def auth_exchange(request: Request, body: AuthExchangeRequest):
     """
-    Exchange Apple identity token for Ditare API key.
+    Exchange Apple identity token for Ditare session token.
     
-    **Stub — implement after DIT-0 (Apple Developer Program active).**
-    Requires Apple Team ID verification.
+    Verifies the Apple identity token (RS256 JWT) against Apple's public keys,
+    upserts the user in Redis, generates a session JWT, and stores the mapping.
     """
-    if not settings.apple_team_id:
+    # Check required configuration
+    if not settings.apple_team_id or not settings.apple_bundle_id:
         raise HTTPException(
-            status_code=501, 
-            detail="Apple auth not yet configured. Complete DIT-0 first."
+            status_code=501,
+            detail="Apple auth not yet configured. Set APPLE_TEAM_ID and APPLE_BUNDLE_ID."
         )
     
-    # TODO: Verify Apple identity token with Apple servers
-    # TODO: Create or lookup user
-    # TODO: Generate API key and store in Redis
-    # TODO: Check RevenueCat entitlement
+    # Validate input
+    if not body.identity_token or not body.apple_user_id:
+        raise HTTPException(status_code=401, detail="Missing identity_token or apple_user_id")
     
-    raise HTTPException(status_code=501, detail="Not yet implemented — waiting for DIT-0")
+    # Verify Apple identity token
+    claims = await verify_apple_token(
+        body.identity_token,
+        body.apple_user_id,
+        settings.apple_bundle_id
+    )
+    
+    # Upsert user in Redis.
+    # Prefer the verified email claim from the Apple token; only fall back to
+    # the client-provided email when the token carries no email claim.
+    email = claims.get("email")
+    if not email and body.email:
+        logger.info(f"No email claim in Apple token for {body.apple_user_id}; using client-provided email")
+        email = body.email
+    upsert_user(body.apple_user_id, email, body.full_name)
+    
+    # Generate session token
+    session_token = generate_session_token(body.apple_user_id, claims.get("sub", body.apple_user_id))
+    
+    # Store token→user mapping in Redis with 30-day TTL
+    redis_client.setex(f"token:user:{session_token}", 2592000, body.apple_user_id)
+    
+    logger.info(f"Auth exchange successful for user {body.apple_user_id}")
+    
+    return AuthExchangeResponse(
+        ok=True,
+        session_token=session_token,
+        expires_in=2592000,
+        user_id=body.apple_user_id
+    )
 
 @app.post("/webhooks/revenuecat")
 @limiter.limit("100/minute")
 async def revenuecat_webhook(request: Request, body: RevenueCatWebhook):
     """
     Idempotent RevenueCat webhook handler.
-    
-    **Stub — wire when RevenueCat project exists.**
+
     Handles subscription events: INITIAL_PURCHASE, RENEWAL, CANCELLATION, etc.
+    - Verifies webhook signature via shared secret
+    - Deduplicates by event.id (stores processed IDs in Redis)
+    - Updates Redis entitlement:pro:<user_id> based on event type
     """
     if not settings.revenuecat_webhook_secret:
         raise HTTPException(
             status_code=501,
             detail="RevenueCat webhook secret not configured"
         )
-    
-    # TODO: Verify webhook signature
-    # TODO: Handle events idempotently (dedupe by event_id)
-    # TODO: Update Redis entitlement state
-    
-    logger.info(f"RevenueCat event received: {body.event.get('type', 'unknown')}")
-    return {"ok": True, "received": True}
+
+    # 1. Verify webhook signature (RevenueCat sends Authorization: Bearer <secret>)
+    auth_header = request.headers.get("authorization", "")
+    expected = f"Bearer {settings.revenuecat_webhook_secret}"
+    if not secrets.compare_digest(auth_header, expected):
+        logger.warning("RevenueCat webhook signature mismatch")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    event = body.event
+    event_id = event.get("id")
+    event_type = event.get("type", "UNKNOWN")
+    app_user_id = event.get("app_user_id")
+
+    if not event_id:
+        logger.warning("RevenueCat webhook missing event.id")
+        raise HTTPException(status_code=400, detail="Missing event.id")
+    if not app_user_id:
+        logger.warning("RevenueCat webhook missing app_user_id")
+        raise HTTPException(status_code=400, detail="Missing app_user_id")
+
+    # 2. Idempotency: dedupe by event.id (Redis key with 7-day TTL)
+    dedupe_key = f"revenuecat:processed:{event_id}"
+    if not redis_client.set(dedupe_key, "1", nx=True, ex=604800):
+        logger.info(f"RevenueCat event {event_id} already processed; skipping")
+        return {"ok": True, "idempotent": True}
+
+    # 3. Update entitlement state based on event type
+    entitlement_key = f"entitlement:pro:{app_user_id}"
+    active_events = {
+        "INITIAL_PURCHASE",
+        "RENEWAL",
+        "NON_RENEWING_PURCHASE",
+        "PRODUCT_CHANGE",
+        "UNCANCELLATION",
+    }
+    inactive_events = {
+        "CANCELLATION",
+        "EXPIRATION",
+        "BILLING_ISSUE",
+        "SUBSCRIPTION_PAUSED",
+    }
+
+    if event_type in active_events:
+        redis_client.set(entitlement_key, "active")
+        logger.info(f"Set pro entitlement active for {app_user_id} (event={event_type})")
+    elif event_type in inactive_events:
+        redis_client.set(entitlement_key, "inactive")
+        logger.info(f"Set pro entitlement inactive for {app_user_id} (event={event_type})")
+    else:
+        logger.info(f"No entitlement change for {app_user_id} (event={event_type})")
+
+    logger.info(f"RevenueCat event {event_id} ({event_type}) processed for {app_user_id}")
+    return {"ok": True, "received": True, "event_type": event_type}
