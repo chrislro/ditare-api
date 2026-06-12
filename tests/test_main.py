@@ -79,13 +79,13 @@ async def test_entitlement_cache_hit():
     
     with patch.object(settings, "env", "production"):
         # Set up cache
-        redis_client.setex("entitlement:pro:test-user", 300, "active")
+        redis_client.setex("entitlement:pro:cache:test-user", 300, "active")
         
         with patch("ditare_api.main.get_user_id", return_value="test-user"):
             result = await check_pro_entitlement("some-token")
             assert result is True
         
-        redis_client.delete("entitlement:pro:test-user")
+        redis_client.delete("entitlement:pro:cache:test-user")
 
 @pytest.mark.asyncio
 async def test_entitlement_cache_inactive():
@@ -93,13 +93,13 @@ async def test_entitlement_cache_inactive():
     from ditare_api.main import check_pro_entitlement
     
     with patch.object(settings, "env", "production"):
-        redis_client.setex("entitlement:pro:test-user-inactive", 300, "inactive")
+        redis_client.setex("entitlement:pro:cache:test-user-inactive", 300, "inactive")
         
         with patch("ditare_api.main.get_user_id", return_value="test-user-inactive"):
             result = await check_pro_entitlement("some-token")
             assert result is False
         
-        redis_client.delete("entitlement:pro:test-user-inactive")
+        redis_client.delete("entitlement:pro:cache:test-user-inactive")
 
 # Existing tests...
 
@@ -218,3 +218,105 @@ def test_auth_exchange_not_configured():
 def test_revenuecat_webhook_not_configured():
     resp = client.post("/webhooks/revenuecat", json={"event": {"type": "TEST"}})
     assert resp.status_code == 501
+# RevenueCat REST API entitlement tests (review follow-ups from CHRA-2504)
+
+def _mock_rc_client(entitlements):
+    """Build a mock httpx.AsyncClient whose GET returns a subscriber payload."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"subscriber": {"entitlements": entitlements}}
+    mock_client = AsyncMock()
+    mock_client.get.return_value = mock_resp
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = False
+    return mock_client
+
+@pytest.mark.asyncio
+async def test_entitlement_expired_subscription_is_inactive():
+    """An expires_date in the past must NOT grant Pro — presence of the field alone
+    is not enough (revenue bug: expired subscribers kept access)."""
+    from ditare_api.main import check_pro_entitlement
+
+    rc = _mock_rc_client({"pro": {"expires_date": "2020-01-01T00:00:00Z"}})
+    with patch.object(settings, "env", "production"), \
+         patch.object(settings, "revenuecat_api_key", "rc-key"), \
+         patch("ditare_api.main.get_user_id", return_value="user-expired"), \
+         patch("ditare_api.main.httpx.AsyncClient", return_value=rc):
+        redis_client.delete("entitlement:pro:cache:user-expired")
+        redis_client.delete("entitlement:pro:user-expired")
+        assert await check_pro_entitlement("tok") is False
+        assert redis_client.get("entitlement:pro:cache:user-expired") == "inactive"
+        redis_client.delete("entitlement:pro:cache:user-expired")
+
+@pytest.mark.asyncio
+async def test_entitlement_future_expiry_is_active():
+    """A future expires_date grants Pro and is cached as active."""
+    from ditare_api.main import check_pro_entitlement
+
+    rc = _mock_rc_client({"pro": {"expires_date": "2099-01-01T00:00:00Z"}})
+    with patch.object(settings, "env", "production"), \
+         patch.object(settings, "revenuecat_api_key", "rc-key"), \
+         patch("ditare_api.main.get_user_id", return_value="user-future"), \
+         patch("ditare_api.main.httpx.AsyncClient", return_value=rc):
+        redis_client.delete("entitlement:pro:cache:user-future")
+        assert await check_pro_entitlement("tok") is True
+        assert redis_client.get("entitlement:pro:cache:user-future") == "active"
+        redis_client.delete("entitlement:pro:cache:user-future")
+
+@pytest.mark.asyncio
+async def test_entitlement_lifetime_null_expiry_is_active():
+    """RevenueCat lifetime/promotional entitlements have expires_date=null and
+    must be treated as active when the pro entitlement exists."""
+    from ditare_api.main import check_pro_entitlement
+
+    rc = _mock_rc_client({"pro": {"expires_date": None}})
+    with patch.object(settings, "env", "production"), \
+         patch.object(settings, "revenuecat_api_key", "rc-key"), \
+         patch("ditare_api.main.get_user_id", return_value="user-lifetime"), \
+         patch("ditare_api.main.httpx.AsyncClient", return_value=rc):
+        redis_client.delete("entitlement:pro:cache:user-lifetime")
+        assert await check_pro_entitlement("tok") is True
+        redis_client.delete("entitlement:pro:cache:user-lifetime")
+
+@pytest.mark.asyncio
+async def test_entitlement_no_pro_entitlement_is_inactive():
+    """A subscriber with no 'pro' entitlement at all is not Pro."""
+    from ditare_api.main import check_pro_entitlement
+
+    rc = _mock_rc_client({})
+    with patch.object(settings, "env", "production"), \
+         patch.object(settings, "revenuecat_api_key", "rc-key"), \
+         patch("ditare_api.main.get_user_id", return_value="user-none"), \
+         patch("ditare_api.main.httpx.AsyncClient", return_value=rc):
+        redis_client.delete("entitlement:pro:cache:user-none")
+        assert await check_pro_entitlement("tok") is False
+        redis_client.delete("entitlement:pro:cache:user-none")
+
+@pytest.mark.asyncio
+async def test_api_cache_does_not_clobber_webhook_entitlement():
+    """The 5-minute API cache must live under its own key so it never overwrites
+    the persistent webhook-set entitlement (entitlement:pro:<user_id>)."""
+    from ditare_api.main import check_pro_entitlement
+
+    rc = _mock_rc_client({"pro": {"expires_date": "2020-01-01T00:00:00Z"}})
+    with patch.object(settings, "env", "production"), \
+         patch.object(settings, "revenuecat_api_key", "rc-key"), \
+         patch("ditare_api.main.get_user_id", return_value="user-sep"), \
+         patch("ditare_api.main.httpx.AsyncClient", return_value=rc):
+        redis_client.delete("entitlement:pro:cache:user-sep")
+        redis_client.set("entitlement:pro:user-sep", "active")  # persistent webhook state
+        await check_pro_entitlement("tok")
+        # Webhook state untouched, no TTL gained
+        assert redis_client.get("entitlement:pro:user-sep") == "active"
+        assert redis_client.ttl("entitlement:pro:user-sep") == -1
+        redis_client.delete("entitlement:pro:user-sep")
+        redis_client.delete("entitlement:pro:cache:user-sep")
+
+def test_generate_session_token_requires_jwt_secret():
+    """generate_session_token must hard-fail when JWT_SECRET is unset instead of
+    silently signing with a throwaway secret (BLOCKER from CHRA-2499)."""
+    from ditare_api.main import generate_session_token
+
+    with patch.object(settings, "jwt_secret", ""):
+        with pytest.raises(RuntimeError, match="JWT_SECRET"):
+            generate_session_token("u1", "apple-sub-1")

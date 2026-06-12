@@ -11,6 +11,7 @@ import redis
 import time
 import secrets
 import json
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel
@@ -126,8 +127,10 @@ async def check_pro_entitlement(token: str) -> bool:
     if not user_id:
         return False
 
-    # 1. Check Redis cache first (5-minute TTL)
-    cache_key = f"entitlement:pro:{user_id}"
+    # 1. Check Redis cache first (5-minute TTL).
+    # NOTE: deliberately a separate key from the persistent webhook state
+    # (entitlement:pro:<user_id>) so the short-TTL API cache never clobbers it.
+    cache_key = f"entitlement:pro:cache:{user_id}"
     cached = redis_client.get(cache_key)
     if cached is not None:
         logger.debug(f"Entitlement cache hit for {user_id}")
@@ -151,8 +154,21 @@ async def check_pro_entitlement(token: str) -> bool:
                 data = resp.json()
                 subscriber = data.get("subscriber", {})
                 entitlements = subscriber.get("entitlements", {})
-                pro_entitlement = entitlements.get("pro", {})
-                is_active = pro_entitlement.get("expires_date") is not None
+                pro_entitlement = entitlements.get("pro")
+                if not pro_entitlement:
+                    is_active = False
+                else:
+                    expires_date = pro_entitlement.get("expires_date")
+                    if expires_date is None:
+                        # Lifetime/promotional entitlements have no expiry
+                        is_active = True
+                    else:
+                        try:
+                            expires_at = datetime.fromisoformat(expires_date.replace("Z", "+00:00"))
+                            is_active = expires_at > datetime.now(timezone.utc)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Unparseable expires_date for {user_id}: {expires_date!r}")
+                            is_active = False
 
                 # Cache result in Redis with 5-minute TTL (300 seconds)
                 cache_value = "active" if is_active else "inactive"
@@ -192,14 +208,6 @@ def get_user_id(token: str) -> Optional[str]:
 
 # Apple JWT verification helpers
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
-
-async def fetch_apple_jwks() -> Dict[str, Any]:
-    """Fetch Apple's public JWKS."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(APPLE_JWKS_URL)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch Apple JWKS")
-        return resp.json()
 
 async def verify_apple_token(identity_token: str, apple_user_id: str, bundle_id: str) -> Dict[str, Any]:
     """Verify Apple identity token (RS256 JWT) and return claims."""
@@ -388,7 +396,8 @@ async def transcribe(
             
             text = resp.text.strip()
             only_punct = all(c in " \t\n!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~" for c in text)
-            if only_punct:
+            if only_punct and text:
+                logger.warning("Transcription output was punctuation-only; returning empty text")
                 text = ""
             
             return {"ok": True, "text": text, "chars": len(text), "provider": provider, "model": model}
@@ -489,8 +498,14 @@ async def auth_exchange(request: Request, body: AuthExchangeRequest):
         settings.apple_bundle_id
     )
     
-    # Upsert user in Redis
-    upsert_user(body.apple_user_id, body.email, body.full_name)
+    # Upsert user in Redis.
+    # Prefer the verified email claim from the Apple token; only fall back to
+    # the client-provided email when the token carries no email claim.
+    email = claims.get("email")
+    if not email and body.email:
+        logger.info(f"No email claim in Apple token for {body.apple_user_id}; using client-provided email")
+        email = body.email
+    upsert_user(body.apple_user_id, email, body.full_name)
     
     # Generate session token
     session_token = generate_session_token(body.apple_user_id, claims.get("sub", body.apple_user_id))
